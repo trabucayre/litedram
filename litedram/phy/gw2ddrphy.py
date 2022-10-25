@@ -25,6 +25,8 @@ from litex.soc.interconnect.csr import *
 from litedram.common import *
 from litedram.phy.dfi import *
 
+class Open(Signal): pass
+
 # BitSlip ------------------------------------------------------------------------------------------
 
 # FIXME: Use BitSlip from litedram.common.
@@ -134,6 +136,8 @@ class GW2DDRPHY(Module, AutoCSR):
             dm_remapping = {}
         assert databits%8 == 0
 
+        write_leveling = True;
+
         # Init -------------------------------------------------------------------------------------
         self.submodules.init = GW2DDRPHYInit()
 
@@ -144,6 +148,7 @@ class GW2DDRPHY(Module, AutoCSR):
         cwl_sys_latency = get_sys_latency(nphases, cwl)
 
         # Registers --------------------------------------------------------------------------------
+        self._rst     = CSRStorage()
         self._dly_sel = CSRStorage(databits//8)
 
         self._rdly_dq_rst         = CSR()
@@ -153,6 +158,36 @@ class GW2DDRPHY(Module, AutoCSR):
 
         self._burstdet_clr  = CSR()
         self._burstdet_seen = CSRStatus(databits//8)
+
+        wlevel_en        = Signal()
+        wlevel_strobe    = Signal()
+        wlevel_wstep     = Signal(8)
+        wlevel_dq_detect = Signal(16)
+        if write_leveling:
+            # DQ before IODELAY -> used for write leveling
+            self._dq_detect       = CSRStatus(16)
+
+            self._wlevel_en       = CSRStorage()
+            self._wlevel_strobe   = CSR()
+            self._wlevel_val      = CSRStorage(8) # WSTEP value
+            self.comb += [
+                wlevel_en.eq(self._wlevel_en.storage),
+                wlevel_strobe.eq(self._wlevel_strobe.re),
+                wlevel_wstep.eq(self._wlevel_val.storage),
+                self._dq_detect.status.eq(wlevel_dq_detect),
+            ]
+
+            # unused ?
+            self._half_sys8x_taps = CSRStorage(5)
+            # clk iodelay
+            self._cdly_inc        = CSR()
+            self._cdly_rst        = CSR()
+            # dq iodelay
+            self._wdly_dq_rst     = CSR()
+            self._wdly_dq_inc     = CSR()
+            # dqs iodelay
+            self._wdly_dqs_rst    = CSR()
+            self._wdly_dqs_inc    = CSR()
 
         # Observation
         self.datavalid = Signal(databits//8)
@@ -174,6 +209,7 @@ class GW2DDRPHY(Module, AutoCSR):
             read_latency  = cl_sys_latency + 10,
             write_latency = cwl_sys_latency,
             read_leveling = True,
+            write_leveling= write_leveling,
             bitslips      = 4,
             delays        = 8,
         )
@@ -190,27 +226,35 @@ class GW2DDRPHY(Module, AutoCSR):
             pads.sel_group(pads_group)
 
             # Clock --------------------------------------------------------------------------------
-            clk_pattern = {0: 0b1010, 1: 0b0101}[clk_polarity]
+            #clk_pattern = {0: 0b1010, 1: 0b0101}[clk_polarity]
+            clk_pattern = {1: 0b1010, 0: 0b0101}[clk_polarity]
             for i in range(len(pads.clk_p)):
                 pad_oddrx2f = Signal()
                 pad_clk = Signal()
-                self.specials += Instance("OSER4",
-                    p_TXCLK_POL = 0b0,
-                    i_RESET = ResetSignal("sys"),
-                    i_PCLK  = ClockSignal("sys"),
-                    i_FCLK  = ClockSignal("sys2x"),
-                    **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
-                    **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(4)},
-                    o_Q0    = pad_oddrx2f
-                )
-                self.specials += Instance("IODELAY",
-                    p_C_STATIC_DLY = cmd_delay,
-                    i_SDTAP = 0,
-                    i_SETN  = 0,
-                    i_VALUE = 0,
-                    i_DI    = pad_oddrx2f,
-                    o_DO    = pad_clk,
-                )
+                bypass_oser_delay = False
+                if bypass_oser_delay:
+                    self.comb += pad_clk.eq(ClockSignal("sys902x"))
+                else:
+                    self.specials += Instance("OSER4",
+                        p_TXCLK_POL = 0b0,
+                        i_RESET = ResetSignal("sys"),
+                        i_PCLK  = ClockSignal("sys"),
+                        #i_FCLK  = ClockSignal("sys2x"),
+                        i_FCLK  = ClockSignal("sys902x"),
+                        **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
+                        **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(4)},
+                        o_Q0    = pad_oddrx2f,
+                        o_Q1    = Open()
+                    )
+                    self.specials += Instance("IODELAY",
+                        p_C_STATIC_DLY = cmd_delay,
+                        i_SDTAP = 0,#~(self._cdly_rst.re | self._rst.storage),
+                        i_SETN  = 0,
+                        i_VALUE = 0,#self._cdly_inc.re,
+                        o_DF    = Open(),
+                        i_DI    = pad_oddrx2f,
+                        o_DO    = pad_clk,
+                    )
                 self.specials += Instance("ELVDS_OBUF",
                     i_I  = pad_clk,
                     o_O  = pads.clk_p[i],
@@ -245,13 +289,15 @@ class GW2DDRPHY(Module, AutoCSR):
                         i_FCLK = ClockSignal("sys2x"),
                         **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
                         **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(4)},
-                        o_Q0   = pad_oddrx2f
+                        o_Q0   = pad_oddrx2f,
+                        o_Q1    = Open()
                     )
                     self.specials += Instance("IODELAY",
                         p_C_STATIC_DLY = cmd_delay,
                         i_SDTAP     = 0,
                         i_SETN      = 0,
                         i_VALUE     = 0,
+                        o_DF        = Open(),
                         i_DI        = pad_oddrx2f,
                         o_DO        = pad[i]
                     )
@@ -271,13 +317,19 @@ class GW2DDRPHY(Module, AutoCSR):
             rdpntr   = Signal(3)
             wrpntr   = Signal(3)
             rdly     = Signal(3)
+            wdly_dqs = Signal(8)
             burstdet = Signal()
+
             self.sync += [
+                If(self._dly_sel.storage[i] & self._wdly_dqs_rst.re, wdly_dqs.eq(0)),
+                If(self._dly_sel.storage[i] & self._wdly_dqs_inc.re, wdly_dqs.eq(wdly_dqs + 1)),
                 If(self._dly_sel.storage[i] & self._rdly_dq_rst.re, rdly.eq(0)),
                 If(self._dly_sel.storage[i] & self._rdly_dq_inc.re, rdly.eq(rdly + 1))
             ]
             self.specials += Instance("DQS",
                 p_DQS_MODE = "X2_DDR3",
+                p_HWL      = "false",
+                #p_HWL      = "true",
                 # Clocks / Reset
                 i_RESET    = ResetSignal("sys"),
                 i_PCLK     = ClockSignal("sys"),
@@ -303,9 +355,11 @@ class GW2DDRPHY(Module, AutoCSR):
                 o_WPOINT   = wrpntr,
                 o_RVALID   = self.datavalid[i],
                 o_RBURST   = burstdet,
+                o_RFLAG    = Open(),
 
                 # Writes (generate shifted ECLK clock for writes)
-                i_WSTEP    = 0, # CHECKME: Useful?
+                i_WSTEP    = wdly_dqs,
+                o_WFLAG    = Open(),
                 o_DQSW270  = dqsw270,
                 o_DQSW0    = dqsw
             )
@@ -319,6 +373,25 @@ class GW2DDRPHY(Module, AutoCSR):
             # DQS ----------------------------------------------------------------------------------
             dqs_o     = Signal()
             dqs_o_oen = Signal()
+
+            #dqs_pattern   = DQSPattern(
+            #    #preamble      = dqs_preamble,  # FIXME
+            #    #postamble     = dqs_postamble, # FIXME
+            #    wlevel_en     = self._wlevel_en.storage,
+            #    wlevel_strobe = self._wlevel_strobe.re)
+            #self.submodules += dqs_pattern
+
+            dqs_pattern = Signal(4)
+            self.comb += [
+                dqs_pattern.eq(0b1010),
+                If(wlevel_en,
+                    dqs_pattern.eq(0b0000),
+                    If(wlevel_strobe,
+                        dqs_pattern.eq(0b0001)
+                    )
+                )
+            ]
+
             self.specials += [
                 Instance("OSER4_MEM",
                     p_TCLK_SOURCE = "DQSW",
@@ -329,7 +402,8 @@ class GW2DDRPHY(Module, AutoCSR):
                     i_TCLK  = dqsw,
                     i_TX0   = ~(dqs_oe | dqs_postamble), # CHECKME: Polarity + Latency.
                     i_TX1   = ~(dqs_oe | dqs_preamble),  # CHECKME: Polatiry + Latency.
-                    **{f"i_D{n}": (0b1010 >> n) & 0b1 for n in range(4)},
+                    **{f"i_D{n}": (dqs_pattern >> n) & 0b1 for n in range(4)},
+
                     o_Q0    = dqs_o,
                     o_Q1    = dqs_o_oen
                 ),
@@ -362,7 +436,8 @@ class GW2DDRPHY(Module, AutoCSR):
                 i_TCLK  = dqsw270,
                 **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
                 **{f"i_D{n}": dm_o_data_muxed[n] for n in range(4)},
-                o_Q0    = pads.dm[i]
+                o_Q0    = pads.dm[i],
+                o_Q1    = Open()
             )
 
             # DQ -----------------------------------------------------------------------------------
@@ -415,6 +490,7 @@ class GW2DDRPHY(Module, AutoCSR):
                 self.comb += dq_i_data.eq(Cat(dq_i_bitslip_o_d, dq_i_bitslip.o))
                 for n in range(8):
                     self.comb += dfi.phases[n//4].rddata[n%4*databits+j].eq(dq_i_data[n])
+                self.sync += wlevel_dq_detect[j].eq(dq_i)
                 self.specials += Instance("IOBUF",
                     i_I   = dq_o,
                     i_OEN = dq_o_oen,
@@ -423,7 +499,7 @@ class GW2DDRPHY(Module, AutoCSR):
                 )
 
         # Read Control Path ------------------------------------------------------------------------
-        rdtap = cl_sys_latency # CHECKME: Latency.
+        rdtap = cl_sys_latency#-1 # CHECKME: Latency.
 
         # Creates a delay line of read commands coming from the DFI interface. The taps are used to
         # control DQS read (internal read pulse of the DQSBUF) and the output of the delay is used
@@ -459,7 +535,7 @@ class GW2DDRPHY(Module, AutoCSR):
 
         self.comb += dq_oe.eq(wrdata_en.taps[wrtap] | wrdata_en.taps[wrtap + 1])
         self.comb += bl8_chunk.eq(wrdata_en.taps[wrtap])
-        self.comb += dqs_oe.eq(dq_oe)
+        self.comb += If(wlevel_en, dqs_oe.eq(1)).Else(dqs_oe.eq(dq_oe))
 
         # Write DQS Postamble/Preamble Control Path ------------------------------------------------
         # Generates DQS Preamble 1 cycle before the first write and Postamble 1 cycle after the last
