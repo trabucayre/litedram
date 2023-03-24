@@ -54,7 +54,7 @@ class BitSlip(Module):
 # Gowin GW2A DDR PHY Initialization -----------------------------------------------------------------
 
 class GW2DDRPHYInit(Module):
-    def __init__(self):
+    def __init__(self, ddr_domain="sys2x"):
         self.pause = Signal()
         self.stop  = Signal()
         self.delay = Signal(8)
@@ -75,7 +75,7 @@ class GW2DDRPHYInit(Module):
         self.specials += Instance("DLL",
             p_SCAL_EN  = "false",
             i_RESET    = ResetSignal("init"),
-            i_CLKIN    = ClockSignal("sys2x"),
+            i_CLKIN    = ClockSignal(ddr_domain),
             i_UPDNCNTL = ~update,
             i_STOP     = freeze,
             o_STEP     = delay,
@@ -118,6 +118,7 @@ class GW2DDRPHYInit(Module):
 class GW2DDRPHY(Module, AutoCSR):
     def __init__(self, pads,
         sys_clk_freq = 100e6,
+        nphases      = 2,
         cl           = None,
         cwl          = None,
         cmd_delay    = 0,
@@ -126,18 +127,21 @@ class GW2DDRPHY(Module, AutoCSR):
         assert isinstance(cmd_delay, int) and cmd_delay < 128
         pads        = PHYPadsCombiner(pads)
         memtype     = "DDR3"
-        tck         = 2/(2*2*sys_clk_freq)
+        tck         = 2/(2*nphases*sys_clk_freq)
         addressbits = len(pads.a)
         bankbits    = len(pads.ba)
         nranks      = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
         databits    = len(pads.dq)
-        nphases     = 2
+        ddr_clk     = ClockSignal(f"sys{nphases}x")
+        ser_name    = f"{2*nphases}"
+
         if not dm_remapping:
             dm_remapping = {}
         assert databits%8 == 0
+        assert nphases in [2, 4]
 
         # Init -------------------------------------------------------------------------------------
-        self.submodules.init = GW2DDRPHYInit()
+        self.submodules.init = GW2DDRPHYInit(ddr_domain=f"sys{nphases}x")
 
         # Parameters -------------------------------------------------------------------------------
         cl  = get_default_cl( memtype, tck) if cl  is None else cl
@@ -166,7 +170,7 @@ class GW2DDRPHY(Module, AutoCSR):
             phytype       = "GW2DDRPHY",
             memtype       = memtype,
             databits      = databits,
-            dfi_databits  = 4*databits,
+            dfi_databits  = 4*databits if nphases == 2 else 2 * databits,
             nranks        = nranks,
             nphases       = nphases,
             rdphase       = rdphase,
@@ -176,12 +180,17 @@ class GW2DDRPHY(Module, AutoCSR):
             read_latency  = cl_sys_latency + 10,
             write_latency = cwl_sys_latency,
             read_leveling = True,
-            bitslips      = 4,
+            bitslips      = 2*nphases,
             delays        = 8,
         )
 
         # DFI Interface ----------------------------------------------------------------------------
-        self.dfi = dfi = Interface(addressbits, bankbits, nranks, 4*databits, nphases)
+        self.dfi = dfi = Interface(
+			addressbits,
+			bankbits,
+			nranks,
+            4*databits if nphases == 2 else 2 * databits,
+            nphases)
 
         # # #
 
@@ -192,18 +201,21 @@ class GW2DDRPHY(Module, AutoCSR):
             pads.sel_group(pads_group)
 
             # Clock --------------------------------------------------------------------------------
-            clk_pattern = {0: 0b1010, 1: 0b0101}[clk_polarity]
+            if nphases == 2:
+                clk_pattern = {0: 0b1010, 1: 0b0101}[clk_polarity]
+            else:
+                clk_pattern = {0: 0b10101010, 1: 0b01010101}[clk_polarity]
             for i in range(len(pads.clk_p)):
-                pad_oddrx2f = Signal()
-                pad_clk = Signal()
-                self.specials += Instance("OSER4",
+                pad_clk_nodelay = Signal()
+                pad_clk         = Signal()
+                self.specials += Instance("OSER" + ser_name,
                     p_TXCLK_POL = 0b0,
                     i_RESET = ResetSignal("sys"),
                     i_PCLK  = ClockSignal("sys"),
-                    i_FCLK  = ClockSignal("sys2x"),
-                    **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
-                    **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(4)},
-                    o_Q0    = pad_oddrx2f,
+                    i_FCLK  = ddr_clk,
+                    **{f"i_TX{n}": 0b0 for n in range(nphases)}, # CHECKME: Polarity
+                    **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(nphases * 2)},
+                    o_Q0    = pad_clk_nodelay,
                     o_Q1    = Open()
                 )
                 self.specials += Instance("IODELAY",
@@ -211,7 +223,7 @@ class GW2DDRPHY(Module, AutoCSR):
                     i_SDTAP = 0,
                     i_SETN  = 0,
                     i_VALUE = 0,
-                    i_DI    = pad_oddrx2f,
+                    i_DI    = pad_clk_nodelay,
                     o_DF    = Open(),
                     o_DO    = pad_clk,
                 )
@@ -241,23 +253,23 @@ class GW2DDRPHY(Module, AutoCSR):
                         raise ValueError(f"DRAM pad {pad_name} required but not found in pads.")
                     continue
                 for i in range(len(pad)):
-                    pad_oddrx2f = Signal()
-                    self.specials += Instance("OSER4",
+                    pad_nodelay = Signal()
+                    self.specials += Instance("OSER" + ser_name,
                         p_TXCLK_POL = 0b0,
                         i_RESET = ResetSignal("sys"),
-                        i_PCLK = ClockSignal("sys"),
-                        i_FCLK = ClockSignal("sys2x"),
-                        **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
-                        **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(4)},
-                        o_Q0   = pad_oddrx2f,
-                        o_Q1   = Open()
+                        i_PCLK  = ClockSignal("sys"),
+                        i_FCLK  = ddr_clk,
+                        **{f"i_TX{n}": 0b0 for n in range(nphases)}, # CHECKME: Polarity
+                        **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(2*nphases)},
+                        o_Q0    = pad_nodelay,
+                        o_Q1    = Open()
                     )
                     self.specials += Instance("IODELAY",
                         p_C_STATIC_DLY = cmd_delay,
                         i_SDTAP     = 0,
                         i_SETN      = 0,
                         i_VALUE     = 0,
-                        i_DI        = pad_oddrx2f,
+                        i_DI        = pad_nodelay,
                         o_DF        = Open(),
                         o_DO        = pad[i]
                     )
@@ -283,11 +295,11 @@ class GW2DDRPHY(Module, AutoCSR):
                 If(self._dly_sel.storage[i] & self._rdly_dq_inc.re, rdly.eq(rdly + 1))
             ]
             self.specials += Instance("DQS",
-                p_DQS_MODE = "X2_DDR3",
+                p_DQS_MODE = "X2_DDR3" if nphases == 2 else "X4",
                 # Clocks / Reset
                 i_RESET    = ResetSignal("sys"),
                 i_PCLK     = ClockSignal("sys"),
-                i_FCLK     = ClockSignal("sys2x"),
+                i_FCLK     = ddr_clk,
                 i_DLLSTEP  = self.init.delay,
                 i_HOLD     = self.init.pause | self._dly_sel.storage[i],
 
@@ -325,19 +337,27 @@ class GW2DDRPHY(Module, AutoCSR):
             ]
 
             # DQS ----------------------------------------------------------------------------------
-            dqs_o     = Signal()
-            dqs_o_oen = Signal()
+            dqs_o       = Signal()
+            dqs_o_oen   = Signal()
+            dqs_phys_oe = Signal(nphases)
+            self.comb += dqs_phys_oe[0].eq(~(dqs_oe | dqs_postamble))
+            if nphases == 2:
+                self.comb += dqs_phys_oe[1].eq(~(dqs_oe | dqs_preamble))
+            else:
+                self.comb += [
+                    dqs_phys_oe[1:-1].eq(~dqs_oe),
+                    dqs_phys_oe[-1].eq(~(dqs_oe | dqs_preamble))
+                ]
             self.specials += [
-                Instance("OSER4_MEM",
+                Instance("OSER" + ser_name + "_MEM",
                     p_TCLK_SOURCE = "DQSW",
                     p_TXCLK_POL   = 0b1,
                     i_RESET = ResetSignal("sys"),
                     i_PCLK  = ClockSignal("sys"),
-                    i_FCLK  = ClockSignal("sys2x"),
+                    i_FCLK  = ddr_clk,
                     i_TCLK  = dqsw,
-                    i_TX0   = ~(dqs_oe | dqs_postamble), # CHECKME: Polarity + Latency.
-                    i_TX1   = ~(dqs_oe | dqs_preamble),  # CHECKME: Polatiry + Latency.
-                    **{f"i_D{n}": (0b1010 >> n) & 0b1 for n in range(4)},
+                    **{f"i_TX{n}": dqs_phys_oe[n] for n in range(nphases)}, # CHECKME: Polarity + Latency.
+                    **{f"i_D{n}": (0b1010 >> (n%4)) & 0b1 for n in range(nphases*2)},
                     o_Q0    = dqs_o,
                     o_Q1    = dqs_o_oen
                 ),
@@ -351,79 +371,92 @@ class GW2DDRPHY(Module, AutoCSR):
             ]
 
             # DM -----------------------------------------------------------------------------------
-            dm_o_data       = Signal(8)
-            dm_o_data_d     = Signal(8)
-            dm_o_data_muxed = Signal(4)
-            for n in range(8):
-                self.comb += dm_o_data[n].eq(dfi.phases[n//4].wrdata_mask[n%4*databits//8+dm_remapping.get(i, i)])
-            self.sync += dm_o_data_d.eq(dm_o_data)
-            dm_bl8_cases = {}
-            dm_bl8_cases[0] = dm_o_data_muxed.eq(dm_o_data[:4])
-            dm_bl8_cases[1] = dm_o_data_muxed.eq(dm_o_data_d[4:])
-            self.sync += Case(bl8_chunk, dm_bl8_cases)
-            self.specials += Instance("OSER4_MEM",
+            #GGM: TODO
+            dm_o_data_muxed = Signal(2 * nphases)
+            if nphases == 2:
+                dm_o_data   = Signal(8)
+                dm_o_data_d = Signal(8)
+                for n in range(8):
+                    self.comb += dm_o_data[n].eq(dfi.phases[n//4].wrdata_mask[n%4*databits//8+dm_remapping.get(i, i)])
+                self.sync += dm_o_data_d.eq(dm_o_data)
+                dm_bl8_cases = {}
+                dm_bl8_cases[0] = dm_o_data_muxed.eq(dm_o_data[:4])
+                dm_bl8_cases[1] = dm_o_data_muxed.eq(dm_o_data_d[4:])
+                self.sync += Case(bl8_chunk, dm_bl8_cases)
+            else:
+                for n in range(8):
+                    self.comb += dm_o_data_muxed[n].eq(dfi.phases[n//2].wrdata_mask[n%2*databits//8+dm_remapping.get(i, i)])
+            self.specials += Instance("OSER" + ser_name + "_MEM",
                 p_TCLK_SOURCE = "DQSW270",
                 p_TXCLK_POL   = 0b0,
                 i_RESET = ResetSignal("sys"),
                 i_PCLK  = ClockSignal("sys"),
-                i_FCLK  = ClockSignal("sys2x"),
+                i_FCLK  = ddr_clk,
                 i_TCLK  = dqsw270,
-                **{f"i_TX{n}": 0b0 for n in range(2)}, # CHECKME: Polarity
-                **{f"i_D{n}": dm_o_data_muxed[n] for n in range(4)},
+                **{f"i_TX{n}": 0b0 for n in range(nphases)}, # CHECKME: Polarity
+                **{f"i_D{n}": dm_o_data_muxed[n] for n in range(nphases*2)},
                 o_Q0    = pads.dm[i],
                 o_Q1    = Open()
             )
 
             # DQ -----------------------------------------------------------------------------------
             for j in range(8*i, 8*(i+1)):
+                dq_o_data_muxed = Signal(2*nphases)
                 dq_o            = Signal()
                 dq_o_oen        = Signal()
                 dq_i            = Signal()
                 dq_i_data       = Signal(8)
-                dq_o_data       = Signal(8)
-                dq_o_data_d     = Signal(8)
-                dq_o_data_muxed = Signal(4)
-                for n in range(8):
-                    self.comb += dq_o_data[n].eq(dfi.phases[n//4].wrdata[n%4*databits+j])
-                self.sync += dq_o_data_d.eq(dq_o_data)
-                dq_bl8_cases = {}
-                dq_bl8_cases[0] = dq_o_data_muxed.eq(dq_o_data[:4])
-                dq_bl8_cases[1] = dq_o_data_muxed.eq(dq_o_data_d[4:])
-                self.sync += Case(bl8_chunk, dq_bl8_cases)
-                self.specials += Instance("OSER4_MEM",
+                if nphases == 2:
+                    dq_o_data       = Signal(8)
+                    dq_o_data_d     = Signal(8)
+                    for n in range(8):
+                        self.comb += dq_o_data[n].eq(dfi.phases[n//4].wrdata[n%4*databits+j])
+                    self.sync += dq_o_data_d.eq(dq_o_data)
+                    dq_bl8_cases = {}
+                    dq_bl8_cases[0] = dq_o_data_muxed.eq(dq_o_data[:4])
+                    dq_bl8_cases[1] = dq_o_data_muxed.eq(dq_o_data_d[4:])
+                    self.sync += Case(bl8_chunk, dq_bl8_cases)
+                else:
+                    for n in range(8):
+                        self.comb += dq_o_data_muxed[n].eq(dfi.phases[n//2].wrdata[n%2*databits+j])
+                self.specials += Instance("OSER" + ser_name + "_MEM",
                     p_TCLK_SOURCE = "DQSW270",
                     p_TXCLK_POL   = 0b0,
                     i_RESET = ResetSignal("sys"),
                     i_PCLK  = ClockSignal("sys"),
-                    i_FCLK  = ClockSignal("sys2x"),
+                    i_FCLK  = ddr_clk,
                     i_TCLK  = dqsw270,
-                    i_TX0   = ~dq_oe, # CHECKME: Polarity + Latency.
-                    i_TX1   = ~dq_oe, # CHECKME: Polarity + Latency.
-                    **{f"i_D{n}": dq_o_data_muxed[n] for n in range(4)},
+                    **{f"i_TX{n}": ~dq_oe for n in range(nphases)}, # CHECKME: Polarity
+                    **{f"i_D{n}": dq_o_data_muxed[n] for n in range(2*nphases)},
                     o_Q0    = dq_o,
                     o_Q1    = dq_o_oen,
                 )
-                dq_i_bitslip = BitSlip(4,
+                dq_i_bitslip = BitSlip(2*nphases,
                     rst    = self._dly_sel.storage[i] & self._rdly_dq_bitslip_rst.re,
                     slp    = self._dly_sel.storage[i] & self._rdly_dq_bitslip.re,
                     cycles = 1)
                 self.submodules += dq_i_bitslip
-                self.specials += Instance("IDES4_MEM",
+                self.specials += Instance("IDES" + ser_name + "_MEM",
                     i_RESET = ResetSignal("sys"),
                     i_PCLK  = ClockSignal("sys"),
-                    i_FCLK  = ClockSignal("sys2x"),
+                    i_FCLK  = ddr_clk,
                     i_ICLK  = dqsr90,
                     i_RADDR = rdpntr,
                     i_WADDR = wrpntr,
                     i_D     = dq_i,
                     i_CALIB = 0,
-                    **{f"o_Q{n}": dq_i_bitslip.i[n] for n in range(4)},
+                    **{f"o_Q{n}": dq_i_bitslip.i[n] for n in range(2*nphases)},
                 )
-                dq_i_bitslip_o_d = Signal(4)
-                self.sync += dq_i_bitslip_o_d.eq(dq_i_bitslip.o)
-                self.comb += dq_i_data.eq(Cat(dq_i_bitslip_o_d, dq_i_bitslip.o))
-                for n in range(8):
-                    self.comb += dfi.phases[n//4].rddata[n%4*databits+j].eq(dq_i_data[n])
+                if nphases == 2:
+                    dq_i_bitslip_o_d = Signal(2*nphases)
+                    self.sync += dq_i_bitslip_o_d.eq(dq_i_bitslip.o)
+                    self.comb += dq_i_data.eq(Cat(dq_i_bitslip_o_d, dq_i_bitslip.o))
+                    for n in range(8):
+                        self.comb += dfi.phases[n//4].rddata[n%4*databits+j].eq(dq_i_data[n])
+                else:
+                    self.comb += dq_i_data.eq(dq_i_bitslip.o)
+                    for n in range(8):
+                        self.comb += dfi.phases[n//2].rddata[n%2*databits+j].eq(dq_i_data[n])
                 self.specials += Instance("IOBUF",
                     i_I   = dq_o,
                     i_OEN = dq_o_oen,
