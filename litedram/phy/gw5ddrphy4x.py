@@ -196,7 +196,7 @@ class GW5DDRPHY4X(Module, AutoCSR):
             pads.sel_group(pads_group)
 
             # Clock --------------------------------------------------------------------------------
-            clk_pattern = {0: 0b10101010, 1: 0b01010101}[clk_polarity]
+            clk_pattern = {1: 0b10101010, 0: 0b01010101}[clk_polarity]
             for i in range(len(pads.clk_p)):
                 pad_clk_nodelay = Signal()
                 pad_clk         = Signal()
@@ -207,20 +207,20 @@ class GW5DDRPHY4X(Module, AutoCSR):
                     i_FCLK  = ClockSignal("sys4x"),
                     **{f"i_TX{n}": 0b0 for n in range(4)},
                     **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(8)},
-                    o_Q0    = pad_clk_nodelay,
+                    o_Q0    = pad_clk,
                     o_Q1    = Open()
                 )
-                self.specials += Instance("IODELAY",
-                    p_C_STATIC_DLY = cmd_delay,
-                    p_DYN_DLY_EN = "FALSE",
-                    p_ADAPT_EN   = "FALSE",
-                    i_SDTAP      = 0,
-                    i_DLYSTEP    = Constant(0, 8),
-                    i_VALUE      = 0,
-                    i_DI         = pad_clk_nodelay,
-                    o_DF         = Open(),
-                    o_DO         = pad_clk,
-                )
+                #self.specials += Instance("IODELAY",
+                #    p_C_STATIC_DLY = cmd_delay,
+                #    p_DYN_DLY_EN = "FALSE",
+                #    p_ADAPT_EN   = "FALSE",
+                #    i_SDTAP      = 0,
+                #    i_DLYSTEP    = Constant(0, 8),
+                #    i_VALUE      = 0,
+                #    i_DI         = pad_clk_nodelay,
+                #    o_DF         = Open(),
+                #    o_DO         = pad_clk,
+                #)
                 self.specials += Instance("ELVDS_OBUF",
                     i_I  = pad_clk,
                     o_O  = pads.clk_p[i],
