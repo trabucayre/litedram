@@ -198,7 +198,7 @@ class GW5DDRPHY4X(Module, AutoCSR):
             # Clock --------------------------------------------------------------------------------
             clk_pattern = {1: 0b10101010, 0: 0b01010101}[clk_polarity]
             for i in range(len(pads.clk_p)):
-                pad_clk_nodelay = Signal()
+                #pad_clk_nodelay = Signal()
                 pad_clk         = Signal()
                 self.specials += Instance("OSER8",
                     p_TXCLK_POL = 0b0,
@@ -255,20 +255,20 @@ class GW5DDRPHY4X(Module, AutoCSR):
                         i_FCLK = ClockSignal("sys4x"),
                         **{f"i_TX{n}": 0b0 for n in range(4)},
                         **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(8)},
-                        o_Q0   = pad_nodelay,
+                        o_Q0   = pad[i],
                         o_Q1   = Open()
                     )
-                    self.specials += Instance("IODELAY",
-                        p_C_STATIC_DLY = cmd_delay,
-                        p_DYN_DLY_EN   = "FALSE",
-                        p_ADAPT_EN     = "FALSE",
-                        i_SDTAP        = 0,
-                        i_DLYSTEP      = Constant(0, 8),
-                        i_VALUE        = 0,
-                        i_DI           = pad_oddrx2f,
-                        o_DF           = Open(),
-                        o_DO           = pad[i]
-                    )
+                    #self.specials += Instance("IODELAY",
+                    #    p_C_STATIC_DLY = cmd_delay,
+                    #    p_DYN_DLY_EN   = "FALSE",
+                    #    p_ADAPT_EN     = "FALSE",
+                    #    i_SDTAP        = 0,
+                    #    i_DLYSTEP      = Constant(0, 8),
+                    #    i_VALUE        = 0,
+                    #    i_DI           = pad_oddrx2f,
+                    #    o_DF           = Open(),
+                    #    o_DO           = pad[i]
+                    #)
 
         # DQS/DM/DQ --------------------------------------------------------------------------------
         dq_oe         = Signal()
@@ -374,7 +374,7 @@ class GW5DDRPHY4X(Module, AutoCSR):
                 p_TXCLK_POL   = 0b0,
                 i_RESET = ResetSignal("sys"),
                 i_PCLK  = ClockSignal("sys"),
-                i_FCLK  = ClockSignal("sys2x"),
+                i_FCLK  = ClockSignal("sys4x"),
                 i_TCLK  = dqsw270,
                 **{f"i_TX{n}": 0b0 for n in range(4)},
                 **{f"i_D{n}": dm_o_data_muxed[n] for n in range(8)},
