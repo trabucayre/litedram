@@ -48,7 +48,7 @@ class S7DDRPHY(Module, AutoCSR):
         if memtype == "DDR4":
             addressbits += 3 # cas_n/ras_n/we_n multiplexed with address
         bankbits    = len(pads.ba) if memtype != "DDR4" else len(pads.ba) + len(pads.bg)
-        nranks      = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
+        nranks      = 1 #if not hasattr(pads, "cs_n") else len(pads.cs_n)
         databits    = len(pads.dq)
         strobes     = len(pads.dqs_p)
         nphases     = nphases
@@ -242,7 +242,8 @@ class S7DDRPHY(Module, AutoCSR):
                         raise ValueError(f"DRAM pad {pad_name} required but not found in pads.")
                     continue
                 for i in range(len(pad)):
-                    oq  = Signal()
+                    oq      = Signal()
+                    dfi_idx = {True: 0, False: i}[dfi_name in ["cs_n", "odt"]]
                     self.specials += Instance("OSERDESE2",
                         p_SERDES_MODE    = "MASTER",
                         p_DATA_WIDTH     = 2*nphases,
@@ -252,7 +253,7 @@ class S7DDRPHY(Module, AutoCSR):
                         i_RST    = ResetSignal("sys") | self._rst.storage,
                         i_CLK    = ClockSignal(ddr_clk),
                         i_CLKDIV = ClockSignal("sys"),
-                        **{f"i_D{n+1}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(8)},
+                        **{f"i_D{n+1}": getattr(dfi.phases[n//2], dfi_name)[dfi_idx] for n in range(8)},
                         i_OCE    = 1,
                         o_OQ     = oq if with_odelay else pad[i],
                     )
